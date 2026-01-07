@@ -58,7 +58,7 @@ pub trait BigSpaceGridEntity {
     fn spawn_grid_commands(
         &self,
         commands: Commands<'_, '_>,
-        grids: Grids,
+        grids: &Grids,
         builder: impl FnOnce(&mut GridCommands),
     );
 }
@@ -67,7 +67,7 @@ impl BigSpaceGridEntity for Entity {
     fn spawn_grid_commands(
         &self,
         commands: Commands<'_, '_>,
-        grids: Grids,
+        grids: &Grids,
         builder: impl FnOnce(&mut GridCommands),
     ) {
         let grid = grids.get(*self);
