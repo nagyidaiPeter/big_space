@@ -82,6 +82,12 @@ pub struct BigSpaceCameraController {
     pub speed_bounds: [f64; 2],
     /// Whether the camera should slow down when approaching an entity's [`Aabb`].
     pub slow_near_objects: bool,
+    /// Whether the nearest-object search requires entities to be visible. When
+    /// `false`, entities with an [`Aabb`] are considered regardless of their
+    /// [`InheritedVisibility`] state. Useful when a render culling system strips
+    /// visibility from distant objects, but you still want distance-based speed
+    /// scaling. Defaults to `true`.
+    pub require_visibility: bool,
     nearest_object: Option<(Entity, f64)>,
     vel_translation: DVec3,
     vel_rotation: DQuat,
@@ -98,6 +104,14 @@ impl BigSpaceCameraController {
     /// Sets the `slow_near_objects` parameter of the controller, and returns the modified result.
     pub fn with_slowing(mut self, slow_near_objects: bool) -> Self {
         self.slow_near_objects = slow_near_objects;
+        self
+    }
+
+    /// Sets whether the nearest-object search requires entities to be visible.
+    /// When `false`, entities are found by [`Aabb`] alone regardless of render
+    /// state. Defaults to `true`.
+    pub fn with_require_visibility(mut self, require: bool) -> Self {
+        self.require_visibility = require;
         self
     }
 
@@ -153,6 +167,7 @@ impl Default for BigSpaceCameraController {
             speed_roll: 1.0,
             speed_bounds: [1e-17, 1e30],
             slow_near_objects: true,
+            require_visibility: true,
             nearest_object: None,
             vel_translation: DVec3::ZERO,
             vel_rotation: DQuat::IDENTITY,
@@ -251,7 +266,7 @@ pub fn nearest_objects_in_grid<F: SpatialHashFilter>(
         &GlobalTransform,
         &Aabb,
         Option<&RenderLayers>,
-        &InheritedVisibility,
+        Option<&InheritedVisibility>,
     )>,
     mut camera: Query<(
         Entity,
@@ -271,6 +286,7 @@ pub fn nearest_objects_in_grid<F: SpatialHashFilter>(
     if !camera.slow_near_objects {
         return;
     }
+    let require_vis = camera.require_visibility;
     let cam_layer = cam_layer.to_owned().unwrap_or_default();
     let cam_children: EntityHashSet = children.iter_descendants(cam_entity).collect();
 
@@ -284,8 +300,9 @@ pub fn nearest_objects_in_grid<F: SpatialHashFilter>(
             &grids,
             &partitions,
             &cell_lookup,
+            require_vis,
         ),
-        _ => nearest_brute_force(&objects, &cam_children, cam_layer, cam_pos),
+        _ => nearest_brute_force(&objects, &cam_children, cam_layer, cam_pos, require_vis),
     };
 
     // Only update when we found something. When nothing is visible (e.g., all
@@ -304,11 +321,12 @@ fn nearest_brute_force(
         &GlobalTransform,
         &Aabb,
         Option<&RenderLayers>,
-        &InheritedVisibility,
+        Option<&InheritedVisibility>,
     )>,
     cam_children: &EntityHashSet,
     cam_layer: &RenderLayers,
     cam_pos: &GlobalTransform,
+    require_visibility: bool,
 ) -> Option<(Entity, f64)> {
     let mut queue = PortableParallel::<Option<(Entity, f64)>>::default();
 
@@ -318,7 +336,7 @@ fn nearest_brute_force(
             let obj_layer = obj_layer.unwrap_or_default();
             if cam_children.contains(&entity)
                 || !cam_layer.intersects(obj_layer)
-                || !visibility.get()
+                || (require_visibility && !visibility.is_some_and(|v| v.get()))
             {
                 return;
             }
@@ -350,7 +368,7 @@ fn nearest_via_partitions<F: SpatialHashFilter>(
         &GlobalTransform,
         &Aabb,
         Option<&RenderLayers>,
-        &InheritedVisibility,
+        Option<&InheritedVisibility>,
     )>,
     cam_children: &EntityHashSet,
     cam_layer: &RenderLayers,
@@ -359,6 +377,7 @@ fn nearest_via_partitions<F: SpatialHashFilter>(
     grids: &Query<&Grid>,
     partitions: &PartitionLookup<F>,
     cell_lookup: &CellLookup<F>,
+    require_visibility: bool,
 ) -> Option<(Entity, f64)> {
     // Bail early if no entities match the query (e.g., all have had visibility components
     // stripped by a render culling system), avoiding an exhaustive partition scan.
@@ -432,7 +451,7 @@ fn nearest_via_partitions<F: SpatialHashFilter>(
                 let obj_layer = obj_layer.unwrap_or_default();
                 if cam_children.contains(entity)
                     || !cam_layer.intersects(obj_layer)
-                    || !visibility.get()
+                    || (require_visibility && !visibility.is_some_and(|v| v.get()))
                 {
                     continue;
                 }
