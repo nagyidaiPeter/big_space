@@ -37,20 +37,20 @@ impl PluginGroup for BigSpaceDefaultPlugins {
 
         group = group
             .add_group(BigSpaceMinimalPlugins)
-            .add(BigSpaceTimingStatsPlugin)
-            .add(BigSpaceValidationPlugin);
+            .add(BigSpaceStationaryPlugin)
+            .add(BigSpaceTimingStatsPlugin);
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(any(debug_assertions, feature = "debug"))]
         {
-            group = group.disable::<BigSpaceValidationPlugin>();
+            group = group.add(BigSpaceValidationPlugin);
         }
         #[cfg(feature = "debug")]
         {
-            group = group.add(BigSpaceDebugPlugin);
+            group = group.add(BigSpaceDebugPlugin::default());
         }
         #[cfg(feature = "camera")]
         {
-            group = group.add(BigSpaceCameraControllerPlugin);
+            group = group.add(BigSpaceCameraControllerPlugin::default());
         }
         group
     }
@@ -112,7 +112,7 @@ impl Plugin for BigSpacePropagationPlugin {
                 LocalFloatingOrigin::compute_all
                     .in_set(BigSpaceSystems::LocalFloatingOrigins)
                     .after(BigSpaceSystems::RecenterLargeTransforms),
-                Grid::propagate_high_precision
+                Grid::propagate_root_grids
                     .in_set(BigSpaceSystems::PropagateHighPrecision)
                     .after(BigSpaceSystems::LocalFloatingOrigins),
                 Grid::propagate_low_precision
@@ -122,8 +122,23 @@ impl Plugin for BigSpacePropagationPlugin {
                 .in_set(TransformSystems::Propagate)
         };
 
-        app.add_systems(PostStartup, configs())
-            .add_systems(PostUpdate, configs());
+        #[cfg(feature = "std")]
+        let hp_system = || {
+            Grid::propagate_high_precision_channeled
+                .in_set(BigSpaceSystems::PropagateHighPrecision)
+                .after(BigSpaceSystems::LocalFloatingOrigins)
+                .in_set(TransformSystems::Propagate)
+        };
+        #[cfg(not(feature = "std"))]
+        let hp_system = || {
+            Grid::propagate_high_precision
+                .in_set(BigSpaceSystems::PropagateHighPrecision)
+                .after(BigSpaceSystems::LocalFloatingOrigins)
+                .in_set(TransformSystems::Propagate)
+        };
+
+        app.add_systems(PostStartup, (configs(), hp_system()))
+            .add_systems(PostUpdate, (configs(), hp_system()));
 
         // These are the bevy transform propagation systems. Because these start from the root
         // of the hierarchy, and BigSpace bundles (at the root) do not contain a Transform,

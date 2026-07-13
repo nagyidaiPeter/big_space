@@ -1,7 +1,9 @@
 //! Logic for propagating transforms through the hierarchy of grids.
 
-use crate::prelude::*;
-use bevy_ecs::prelude::*;
+use crate::{prelude::*, stationary::GridDirtyTick};
+use bevy_ecs::{prelude::*, system::SystemChangeTick};
+#[cfg(feature = "std")]
+use bevy_log::tracing::Instrument;
 use bevy_reflect::Reflect;
 use bevy_transform::prelude::*;
 
@@ -16,74 +18,244 @@ use bevy_transform::prelude::*;
 pub struct LowPrecisionRoot;
 
 impl Grid {
-    /// Update the `GlobalTransform` of entities with a [`CellCoord`], using the [`Grid`] the entity
-    /// belongs to.
+    /// Update the [`GlobalTransform`] of root [`BigSpace`] grids.
+    ///
+    /// Root grids don't have a [`CellCoord`], so they aren't covered by
+    /// [`Self::propagate_high_precision`]. Their GT is determined entirely by the
+    /// [`LocalFloatingOrigin`].
+    pub fn propagate_root_grids(
+        mut root_grids: Query<(&Grid, &mut GlobalTransform), With<BigSpace>>,
+    ) {
+        root_grids.par_iter_mut().for_each(|(grid, mut gt)| {
+            if !grid.local_floating_origin().is_local_origin_unchanged() {
+                *gt = grid.global_transform(&CellCoord::default(), &Transform::IDENTITY);
+            }
+        });
+    }
+
+    /// Update the [`GlobalTransform`] of all entities with a [`CellCoord`], including both sub-grid
+    /// entities and leaf entities.
+    ///
+    /// Runs as a flat [`Query::par_iter_mut`], looking up each entity's parent [`Grid`] to retrieve
+    /// the [`LocalFloatingOrigin`] already propagated by [`LocalFloatingOrigin::compute_all`].
+    /// Every entity's GT depends only on its own components (owned) and its parent grid's
+    /// [`LocalFloatingOrigin`] (shared read), so this is trivially parallelizable with no unsafe
+    /// code.
+    ///
+    /// If [`GridDirtyTick`] is present on the parent grid (inserted by
+    /// [`BigSpaceStationaryPlugin`]), entities in clean subtrees are skipped entirely.
     pub fn propagate_high_precision(
+        system_ticks: SystemChangeTick,
         mut stats: Option<ResMut<crate::timing::PropagationStats>>,
-        grids: Query<&Grid>,
-        mut entities: ParamSet<(
-            Query<(
+        grids: Query<(&Grid, Option<&GridDirtyTick>)>,
+        mut entities: Query<
+            (
                 Ref<CellCoord>,
                 Ref<Transform>,
                 Ref<ChildOf>,
                 &mut GlobalTransform,
-            )>,
-            Query<(&Grid, &mut GlobalTransform), With<BigSpace>>,
-        )>,
+                Option<&Stationary>,
+                Option<&StationaryInitialized>,
+            ),
+            With<CellCoord>,
+        >,
     ) {
         let start = bevy_platform::time::Instant::now();
 
-        // Performance note: I've also tried to iterate over each grid's children at once, to avoid
-        // the grid and parent lookup, but that made things worse because it prevented dumb
-        // parallelism. The only thing I can see to make this faster is archetype change detection.
-        // Change filters are not archetype filters, so they scale with the total number of entities
-        // that match the query, regardless of change.
-        entities
-            .p0()
-            .par_iter_mut()
-            .for_each(|(cell, transform, parent, mut global_transform)| {
-                if let Ok(grid) = grids.get(parent.parent()) {
-                    // Optimization: we don't need to recompute the transforms if the entity hasn't
-                    // moved and the floating origin's local origin in that grid hasn't changed.
-                    //
-                    // This also ensures we don't trigger change detection on GlobalTransforms when
-                    // they haven't changed.
-                    //
-                    // This check can have a big impact on reducing computations for entities in the
-                    // same grid as the floating origin, i.e. the main camera. It also means that as
-                    // the floating origin moves between cells, that could suddenly cause a spike in
-                    // the amount of computation needed that grid. In the future, we might be able
-                    // to spread that work across grids, entities far away can maybe be delayed for
-                    // a grid or two without being noticeable.
-                    if !grid.local_floating_origin().is_local_origin_unchanged()
-                        || transform.is_changed()
-                        || cell.is_changed()
-                        || parent.is_changed()
-                    {
-                        *global_transform = grid.global_transform(&cell, &transform);
-                    }
-                }
-            });
+        entities.par_iter_mut().for_each(
+            |(cell, transform, parent_rel, mut gt, stationary, computed)| {
+                let Ok((grid, dirty_tick)) = grids.get(parent_rel.parent()) else {
+                    return;
+                };
 
-        // Root grids
-        //
-        // These are handled separately because the root grid doesn't have a Transform or GridCell -
-        // it wouldn't make sense because it is the root, and these components are relative to their
-        // parent. Due to floating origins, it *is* possible for the root grid to have a
-        // GlobalTransform - this is what makes it possible to place a low precision (Transform
-        // only) entity in a root transform - it is relative to the origin of the root grid.
-        entities
-            .p1()
-            .iter_mut()
-            .for_each(|(grid, mut global_transform)| {
-                if grid.local_floating_origin().is_local_origin_unchanged() {
-                    return; // By definition, this means the grid has not moved
+                let is_stationary = stationary.is_some();
+                let is_computed = computed.is_some();
+
+                // Grid-level early exit: we can only skip when BOTH conditions hold:
+                // 1. The grid's local floating origin hasn't moved (no cell change by the FO), AND
+                // 2. The subtree is clean (no non-stationary entity changed this frame).
+                // If the FO moved to a new cell, every entity in the grid needs a new GT
+                // regardless of whether the entity itself changed.
+                let subtree_clean = dirty_tick.is_some_and(|dt| !dt.is_dirty(system_ticks));
+                if grid.local_floating_origin().is_local_origin_unchanged() && subtree_clean {
+                    return;
                 }
-                // The global transform of the root grid is the same as the transform of an entity
-                // at the origin - it is determined entirely by the local origin position:
-                *global_transform =
-                    grid.global_transform(&CellCoord::default(), &Transform::IDENTITY);
-            });
+
+                // Recompute GT when:
+                // - The grid's local origin moved (FO changed cells), forcing all entities to
+                //   update even if they haven't moved themselves, OR
+                // - The entity's own transform/cell/parent changed, OR
+                // - The entity is stationary but hasn't had its initial GT computed yet.
+                if !grid.local_floating_origin().is_local_origin_unchanged()
+                    || (transform.is_changed() && !is_stationary)
+                    || cell.is_changed()
+                    || parent_rel.is_changed()
+                    || (is_stationary && !is_computed)
+                {
+                    *gt = grid.global_transform(&cell, &transform);
+                }
+            },
+        );
+
+        if let Some(stats) = stats.as_mut() {
+            stats.high_precision_propagation += start.elapsed();
+        }
+    }
+
+    /// Update the [`GlobalTransform`] of all entities with a [`CellCoord`], using a
+    /// producer-consumer architecture with a [`BufferedChannel`].
+    ///
+    /// Producer tasks split each dirty [`Grid`]'s children into chunks and send
+    /// non-stationary entities through a buffered channel. Consumer workers pull batches
+    /// concurrently and update [`GlobalTransform`] via [`Query::get_unchecked`].
+    ///
+    /// This is the default high-precision propagation system on `std` targets. The flat
+    /// [`Self::propagate_high_precision`] variant is used on `no_std`.
+    ///
+    /// [`BufferedChannel`]: crate::buffered_channel::BufferedChannel
+    #[allow(rustdoc::private_intra_doc_links)]
+    /// [`ComputeTaskPool`]: bevy_tasks::ComputeTaskPool
+    #[cfg(feature = "std")]
+    #[expect(
+        unsafe_code,
+        reason = "Uses get_unchecked and a Send wrapper for sharing queries across threads."
+    )]
+    pub fn propagate_high_precision_channeled(
+        system_ticks: SystemChangeTick,
+        mut stats: Option<ResMut<crate::timing::PropagationStats>>,
+        grids: Query<(Entity, &Grid, Option<&GridDirtyTick>, Option<&Children>)>,
+        entities: Query<
+            (
+                Ref<CellCoord>,
+                Ref<Transform>,
+                Ref<ChildOf>,
+                &mut GlobalTransform,
+                Has<Stationary>,
+                Has<StationaryInitialized>,
+            ),
+            With<CellCoord>,
+        >,
+        // Lightweight filter used by producers to skip sleeping stationary entities before
+        // sending them through the channel. The `fo_unchanged` guard on the producer side
+        // ensures this is only checked when the floating origin hasn't moved - when the FO
+        // moves, all entities (including sleeping ones) need GT recomputation, so they are
+        // sent unconditionally.
+        stationary_filter: Query<(), (With<Stationary>, With<StationaryInitialized>)>,
+        mut channel: Local<crate::buffered_channel::BufferedChannel<Entity>>,
+    ) {
+        let start = bevy_platform::time::Instant::now();
+        let task_pool = bevy_tasks::ComputeTaskPool::get();
+        let shared_entities = &entities;
+        let shared_grids = &grids;
+        let shared_filter = &stationary_filter;
+        let n_threads = task_pool.thread_num().max(1);
+
+        task_pool.scope(|scope| {
+            // Tuned via benchmarking
+            channel.chunk_size = 4096;
+            let (rx, tx) = channel.unbounded();
+
+            // Spawn consumer workers upfront so they start pulling work immediately.
+            for _ in 0..n_threads {
+                let rx = rx.clone();
+                scope.spawn(
+                    async move {
+                        while let Ok(chunk) = rx.recv().await {
+                            for &entity in chunk.iter() {
+                                // SAFETY: Each entity is sent through the channel at most
+                                // once (each entity has exactly one parent grid, and each
+                                // grid's children are sent exactly once by the producers).
+                                // Therefore, no two consumer tasks will call get_unchecked
+                                // on the same entity.
+                                let Ok((
+                                    cell,
+                                    transform,
+                                    parent,
+                                    mut gt,
+                                    is_stationary,
+                                    is_computed,
+                                )) = (unsafe { shared_entities.get_unchecked(entity) })
+                                else {
+                                    continue;
+                                };
+
+                                // Read-only lookup of the parent grid.
+                                let Ok((_, grid, _, _)) = shared_grids.get(parent.parent()) else {
+                                    continue;
+                                };
+
+                                if !grid.local_floating_origin().is_local_origin_unchanged()
+                                    || (transform.is_changed() && !is_stationary)
+                                    || cell.is_changed()
+                                    || parent.is_changed()
+                                    || (is_stationary && !is_computed)
+                                {
+                                    *gt = grid.global_transform(&cell, &transform);
+                                }
+                            }
+                        }
+                    }
+                    .instrument(bevy_log::info_span!("hp_propagation_worker")),
+                );
+            }
+            drop(rx);
+
+            // Producers: par_iter over grids for wide-hierarchy parallelism.
+            // Small dirty grids send children directly from the par_iter thread.
+            // Large dirty grids are collected via thread-local storage (no
+            // contention) and chunked into separate scope tasks after par_iter.
+            let min_chunk = n_threads * 10;
+            let mut large_grids = bevy_utils::Parallel::<Vec<(Entity, bool)>>::default();
+            grids.par_iter().for_each_init(
+                || tx.clone(),
+                |sender, (grid_entity, grid, dirty_tick, children)| {
+                    let fo_unchanged = grid.local_floating_origin().is_local_origin_unchanged();
+                    let subtree_clean = dirty_tick.is_some_and(|dt| !dt.is_dirty(system_ticks));
+                    if fo_unchanged && subtree_clean {
+                        return;
+                    }
+                    let Some(children) = children else { return };
+
+                    if children.len() < min_chunk {
+                        // Small grid — send directly from this par_iter thread.
+                        for child in children.iter() {
+                            if fo_unchanged && shared_filter.contains(child) {
+                                continue;
+                            }
+                            sender.send_blocking(child).ok();
+                        }
+                    } else {
+                        // Large grid — collect into thread-local vec for chunking.
+                        large_grids
+                            .borrow_local_mut()
+                            .push((grid_entity, fo_unchanged));
+                    }
+                },
+            );
+
+            // Spawn chunked producer tasks for large grids.
+            for (grid_entity, fo_unchanged) in large_grids.drain() {
+                let Ok((_, _, _, Some(children))) = shared_grids.get(grid_entity) else {
+                    continue;
+                };
+                let chunk_size = (children.len() / n_threads / 10).max(1);
+                for child_chunk in children.chunks(chunk_size) {
+                    let mut chunk_sender = tx.clone();
+                    scope.spawn(
+                        async move {
+                            for &child in child_chunk {
+                                if fo_unchanged && shared_filter.contains(child) {
+                                    continue;
+                                }
+                                chunk_sender.send_blocking(child).ok();
+                            }
+                        }
+                        .instrument(bevy_log::info_span!("hp_propagation_producer")),
+                    );
+                }
+            }
+            drop(tx);
+        });
 
         if let Some(stats) = stats.as_mut() {
             stats.high_precision_propagation += start.elapsed();
@@ -174,12 +346,16 @@ impl Grid {
     ) {
         let start = bevy_platform::time::Instant::now();
         let update_transforms = |low_precision_root, parent_transform: Ref<GlobalTransform>| {
-            // High precision global transforms are change-detected, and are only updated if that
+            // High precision global transforms are change-detected and are only updated if that
             // entity has moved relative to the floating origin's grid cell.
             let changed = parent_transform.is_changed();
 
+            #[expect(
+                unsafe_code,
+                reason = "`propagate_recursive()` is unsafe due to its use of `Query::get_unchecked()`."
+            )]
             // SAFETY:
-            // - Unlike the bevy version of this, we do not iterate over all children of the root,
+            // - Unlike the bevy version of this, we do not iterate over all children of the root
             //   and manually verify each child has a parent component that points back to the same
             //   entity. Instead, we query the roots directly, so we know they are unique.
             // - We may operate as if all descendants are consistent, since `propagate_recursive`
@@ -189,10 +365,6 @@ impl Grid {
             //   other root entities' `propagate_recursive` calls will not conflict with this one.
             // - Since this is the only place where `transform_query` gets used, there will be no
             //   conflicting fetches elsewhere.
-            #[expect(
-                unsafe_code,
-                reason = "`propagate_recursive()` is unsafe due to its use of `Query::get_unchecked()`."
-            )]
             unsafe {
                 Self::propagate_recursive(
                     &parent_transform,
@@ -236,11 +408,7 @@ impl Grid {
         parent: &GlobalTransform,
         transform_query: &Query<
             (Ref<Transform>, &mut GlobalTransform, Option<&Children>),
-            (
-                With<ChildOf>,
-                Without<CellCoord>, // ***ADDED*** Only recurse low-precision entities
-                Without<Grid>,      // ***ADDED*** Only recurse low-precision entities
-            ),
+            (With<ChildOf>, Without<CellCoord>, Without<Grid>),
         >,
         parent_query: &Query<
             (Entity, Ref<ChildOf>),
@@ -300,6 +468,97 @@ mod tests {
     use crate::plugin::BigSpaceMinimalPlugins;
     use crate::prelude::*;
     use bevy::prelude::*;
+
+    /// Verifies that entities in sub-grids get the correct `GlobalTransform`.
+    ///
+    /// Hierarchy: Root `BigSpace` → `SubGrid` (`CellCoord` + Grid + Transform(100,0,0))
+    ///                                  → Entity (`CellCoord` + Transform(50,0,0))
+    ///
+    /// Entity's GT should be 100 + 50 = 150 from the root FO.
+    #[test]
+    fn sub_grid_gt_is_correct() {
+        #[derive(Component)]
+        struct TestEntity;
+
+        let mut app = App::new();
+        app.add_plugins(BigSpaceMinimalPlugins)
+            .add_systems(Startup, |mut commands: Commands| {
+                commands.spawn_big_space_default(|root| {
+                    root.spawn_spatial(FloatingOrigin);
+                    // Sub-grid at (100, 0, 0) in root grid containing an entity at (50, 0, 0).
+                    root.with_grid_default(|sub_grid| {
+                        sub_grid.insert(Transform::from_xyz(100.0, 0.0, 0.0));
+                        sub_grid.spawn_spatial((Transform::from_xyz(50.0, 0.0, 0.0), TestEntity));
+                    });
+                });
+            });
+
+        app.update();
+
+        let mut q = app
+            .world_mut()
+            .query_filtered::<&GlobalTransform, With<TestEntity>>();
+        let gt = *q.single(app.world()).unwrap();
+        assert_eq!(
+            gt.translation(),
+            Vec3::new(150.0, 0.0, 0.0),
+            "Entity in sub-grid should have GT = sub-grid pos + entity pos = 150"
+        );
+    }
+
+    /// Verifies that the root `BigSpace` grid's `GlobalTransform` updates when the floating
+    /// origin moves to a new cell. The root grid has no `CellCoord`, so it must be handled
+    /// separately from the flat `par_iter` over `CellCoord` entities.
+    #[test]
+    fn root_grid_gt_updates_when_fo_moves() {
+        let mut app = App::new();
+        app.add_plugins(BigSpaceMinimalPlugins)
+            .add_systems(Startup, |mut commands: Commands| {
+                commands.spawn_big_space_default(|root| {
+                    root.spawn_spatial(FloatingOrigin);
+                });
+            });
+
+        app.update();
+
+        // Find the FO and root grid
+        let fo = app
+            .world_mut()
+            .query_filtered::<Entity, With<FloatingOrigin>>()
+            .single(app.world())
+            .unwrap();
+        let root = app
+            .world_mut()
+            .query_filtered::<Entity, With<BigSpace>>()
+            .single(app.world())
+            .unwrap();
+
+        let root_gt_before = app
+            .world()
+            .get::<GlobalTransform>(root)
+            .unwrap()
+            .translation();
+        assert_eq!(root_gt_before, Vec3::ZERO);
+
+        // Move FO to cell (1, 0, 0) - root GT should shift by -cell_size
+        app.world_mut()
+            .entity_mut(fo)
+            .get_mut::<CellCoord>()
+            .unwrap()
+            .x = 1;
+        app.update();
+
+        let root_gt_after = app
+            .world()
+            .get::<GlobalTransform>(root)
+            .unwrap()
+            .translation();
+        assert_ne!(
+            root_gt_after,
+            Vec3::ZERO,
+            "Root grid GT must update when the floating origin moves to a new cell"
+        );
+    }
 
     #[test]
     fn low_precision_in_big_space() {

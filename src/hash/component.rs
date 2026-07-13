@@ -1,9 +1,8 @@
 //! Components for spatial hashing.
 
-use alloc::vec::Vec;
-use core::hash::{BuildHasher, Hash, Hasher};
-
+use super::{ChangedCells, SpatialHashFilter};
 use crate::prelude::*;
+use alloc::vec::Vec;
 use bevy_ecs::prelude::*;
 use bevy_math::IVec3;
 use bevy_platform::{
@@ -12,8 +11,7 @@ use bevy_platform::{
     time::Instant,
 };
 use bevy_reflect::Reflect;
-
-use super::{ChangedCells, SpatialHashFilter};
+use core::hash::{BuildHasher, Hash, Hasher};
 
 use crate::portable_par::PortableParallel;
 
@@ -126,9 +124,16 @@ impl CellId {
         }
     }
 
-    /// Do not use this to manually construct this component. You've been warned.
-    #[doc(hidden)]
-    pub fn __new_manual(parent: Entity, cell: &CellCoord) -> Self {
+    /// Manually construct a [`CellId`] from a grid entity and cell coordinate.
+    ///
+    /// # Warning
+    ///
+    /// Prefer letting the plugin compute [`CellId`] automatically. Only use this when you
+    /// need to pre-compute a [`CellId`] at spawn time for batch insertion (e.g. to avoid
+    /// the one-frame delay of deferred commands). The caller is responsible for ensuring
+    /// that `parent` is a valid [`Grid`] entity and that `cell` matches the entity's
+    /// [`CellCoord`].
+    pub fn new_manual(parent: Entity, cell: &CellCoord) -> Self {
         Self::from_parent(parent, cell)
     }
 
@@ -175,20 +180,28 @@ impl CellId {
 
     /// Update or insert the [`CellId`] of all changed entities that match the optional
     /// [`SpatialHashFilter`].
+    #[allow(clippy::too_many_arguments)]
     pub fn update<F: SpatialHashFilter>(
         mut commands: Commands,
         mut changed_cells: ResMut<ChangedCells<F>>,
         mut spatial_entities: Query<
-            (Entity, &ChildOf, &CellCoord, &mut CellId, &mut CellHash),
-            (F, Or<(Changed<ChildOf>, Changed<CellCoord>)>),
+            (Entity, &ChildOf, Ref<CellCoord>, &mut CellId, &mut CellHash),
+            (
+                F,
+                Without<Stationary>,
+                Or<(Changed<ChildOf>, Changed<CellCoord>)>,
+            ),
         >,
-        added_entities: Query<(Entity, &ChildOf, &CellCoord), (F, Without<CellId>)>,
+        added_entities: Query<
+            (Entity, &ChildOf, &CellCoord),
+            (F, Without<Stationary>, Without<CellId>),
+        >,
+        mut removed_cells: RemovedComponents<CellCoord>,
         mut stats: Option<ResMut<crate::timing::GridHashStats>>,
         mut thread_updated_hashes: Local<PortableParallel<Vec<Entity>>>,
         mut thread_commands: Local<PortableParallel<Vec<(Entity, CellId, CellHash)>>>,
     ) {
         let start = Instant::now();
-        changed_cells.updated.clear();
 
         // Create new
         added_entities
@@ -206,15 +219,27 @@ impl CellId {
         // Update existing
         spatial_entities.par_iter_mut().for_each(
             |(entity, parent, cell, mut cell_guid, mut fast_hash)| {
-                let new_cell_guid = CellId::new(parent, cell);
-                let new_fast_hash = new_cell_guid.pre_hash;
+                let parent_entity = parent.parent();
+                if cell_guid.coord == *cell && cell_guid.grid == parent_entity {
+                    // Values are already correct. Always register in ChangedCells so
+                    // CellLookup picks up the entity. This covers initial spawn with a
+                    // pre-computed CellId as well as re-entry into the pipeline after
+                    // the entity temporarily stopped matching the filter.
+                    thread_updated_hashes.scope(|tl| tl.push(entity));
+                    return;
+                }
+
+                let new_cell_guid = CellId::from_parent(parent_entity, &cell);
                 if cell_guid.replace_if_neq(new_cell_guid).is_some() {
                     thread_updated_hashes.scope(|tl| tl.push(entity));
                 }
-                fast_hash.0 = new_fast_hash;
+                fast_hash.0 = new_cell_guid.pre_hash;
             },
         );
-        changed_cells.updated.extend(thread_updated_hashes.drain());
+
+        changed_cells
+            .updated
+            .extend(thread_updated_hashes.drain().chain(removed_cells.read()));
 
         if let Some(ref mut stats) = stats {
             stats.hash_update_duration += start.elapsed();
@@ -229,5 +254,68 @@ impl CellId {
     /// The [`ChildOf`] [`Grid`] of this spatial hash.
     pub fn grid(&self) -> Entity {
         self.grid
+    }
+
+    /// One-time [`CellId`] computation for [`Stationary`] entities matching filter `F`.
+    ///
+    /// Computes and inserts [`CellId`]/[`CellHash`] and populates [`ChangedCells<F>`].
+    /// [`StationaryInitialized`] is inserted later by [`BigSpaceStationaryPlugin`], giving
+    /// every system one full frame to process the entity before it goes to sleep.
+    ///
+    /// When multiple [`CellHashingPlugin<F>`] instances exist with overlapping filters, the
+    /// `CellId` computation is idempotent ([`set_if_neq`](DetectChangesMut::set_if_neq))
+    /// and each variant populates its own [`ChangedCells<F>`].
+    pub fn compute_stationary_cell<F: SpatialHashFilter>(
+        mut commands: Commands,
+        grids: Query<&Grid>,
+        mut stationary: Query<
+            (
+                Entity,
+                &mut CellCoord,
+                &mut bevy_transform::prelude::Transform,
+                &ChildOf,
+                Option<&mut CellId>,
+                Option<&mut CellHash>,
+            ),
+            (F, With<Stationary>, Without<StationaryInitialized>),
+        >,
+        mut changed_cells: ResMut<ChangedCells<F>>,
+    ) {
+        // Collect entities that need CellId/CellHash inserted (don't have them yet).
+        // This is separated from the main loop so we can use par_iter_mut for the
+        // common case (entities that already have CellId).
+        let mut needs_insert: Vec<(Entity, CellId, CellHash)> = Vec::new();
+
+        for (entity, mut grid_pos, mut transform, parent, cell_id, cell_hash) in
+            stationary.iter_mut()
+        {
+            let parent_entity = parent.parent();
+            if let Ok(grid) = grids.get(parent_entity) {
+                let (grid_cell_delta, translation) = grid
+                    .imprecise_translation_to_grid(transform.bypass_change_detection().translation);
+                *grid_pos += grid_cell_delta;
+                transform.translation = translation;
+
+                let current_id = CellId::new(parent, &grid_pos);
+                if let (Some(mut existing_id), Some(mut existing_hash)) = (cell_id, cell_hash) {
+                    existing_id.set_if_neq(current_id);
+                    existing_hash.set_if_neq(CellHash::from(current_id));
+                } else {
+                    needs_insert.push((entity, current_id, current_id.into()));
+                }
+                changed_cells.insert(entity);
+            }
+        }
+
+        // Batch-insert CellId/CellHash for entities that didn't have them.
+        if !needs_insert.is_empty() {
+            commands.queue(move |world: &mut World| {
+                world.insert_batch(
+                    needs_insert
+                        .into_iter()
+                        .map(|(entity, cell_id, cell_hash)| (entity, (cell_id, cell_hash))),
+                );
+            });
+        }
     }
 }
